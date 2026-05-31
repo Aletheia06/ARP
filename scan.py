@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""扫描局域网在线设备，显示 IP、MAC、厂商、主机名、设备类型和自定义别名。"""
+"""Scan the LAN for online devices and show IP, MAC, vendor, hostname, type and alias."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from scapy.all import ARP, Ether, conf, get_if_addr, get_if_hwaddr, get_if_list, srp
@@ -120,7 +121,7 @@ def load_aliases() -> dict[str, dict[str, str]]:
     try:
         raw = json.loads(ALIASES_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        print(f"[warn] 无法读取 {ALIASES_PATH.name}: {exc}", file=sys.stderr)
+        print(f"[warn] cannot read {ALIASES_PATH.name}: {exc}", file=sys.stderr)
         return aliases
 
     for key in aliases:
@@ -169,7 +170,7 @@ def load_oui_data(refresh: bool) -> dict[str, str]:
                 vendors.update(scapy_vendors)
                 save_oui_cache(scapy_vendors)
     except Exception as exc:
-        print(f"[warn] 载入 Scapy 厂商库失败，改用内置表/缓存: {exc}", file=sys.stderr)
+        print(f"[warn] failed to load Scapy vendor DB, using builtin/cache: {exc}", file=sys.stderr)
 
     return vendors
 
@@ -179,7 +180,7 @@ def interface_priority(iface: str, ip_obj: ipaddress.IPv4Address) -> tuple[int, 
     score = 0
     if ip_obj.is_private:
         score += 100
-    if any(word in name for word in ("wi-fi", "wlan", "wireless", "ethernet", "以太网")):
+    if any(word in name for word in ("wi-fi", "wlan", "wireless", "ethernet")):
         score += 30
     if any(word in name for word in ("docker", "wsl", "vmware", "virtual", "hyper-v", "vbox")):
         score -= 40
@@ -212,7 +213,7 @@ def iter_ipv4_interfaces() -> list[tuple[str, str, ipaddress.IPv4Address]]:
 def choose_scan_target(subnet_arg: str | None) -> tuple[str, str, ipaddress.IPv4Network]:
     candidates = iter_ipv4_interfaces()
     if not candidates:
-        raise RuntimeError("没有找到可用的 IPv4 网卡")
+        raise RuntimeError("no usable IPv4 interface found")
 
     default_route_ip = resolve_default_route_interface_ip()
     if default_route_ip:
@@ -330,6 +331,8 @@ def resolve_hostname_with_nbtstat(ip: str) -> str:
 
 
 def resolve_hostname(ip: str) -> str:
+    """OS-level reverse lookups only. NOT thread-safe with scapy, but these calls are,
+    so this is what runs inside the thread pool."""
     try:
         return socket.gethostbyaddr(ip)[0]
     except (socket.herror, socket.gaierror, OSError):
@@ -342,6 +345,75 @@ def resolve_hostname(ip: str) -> str:
     if platform.system() == "Windows":
         return resolve_hostname_with_nbtstat(ip)
     return ""
+
+
+def mdns_reverse_lookup(ips: list[str], iface: str, timeout: float = 2.0) -> dict[str, str]:
+    """Resolve .local names via mDNS (Bonjour) for many IPs at once.
+
+    Phones (iOS/Android) ignore reverse-DNS and NetBIOS but answer mDNS. This sends
+    one reverse-PTR query per IP, then sniffs all replies in a SINGLE main-thread
+    session -- scapy is not thread-safe, so we must never do this from a thread pool.
+    """
+    result: dict[str, str] = {}
+    if not ips:
+        return result
+    try:
+        from scapy.all import IP, UDP, DNS, DNSQR, DNSRR, AsyncSniffer, sendp
+    except Exception:
+        return result
+
+    try:
+        sniffer = AsyncSniffer(iface=iface, filter="udp port 5353", store=True)
+        sniffer.start()
+    except Exception:
+        return result
+
+    time.sleep(0.2)
+    for ip in ips:
+        rev = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+        # The top bit of qclass is the QU (unicast-response) flag, so devices reply directly.
+        query = (
+            Ether(dst="01:00:5e:00:00:fb")
+            / IP(dst="224.0.0.251")
+            / UDP(sport=5353, dport=5353)
+            / DNS(rd=0, qd=DNSQR(qname=rev, qtype="PTR", qclass=0x8001))
+        )
+        try:
+            sendp(query, iface=iface, verbose=0)
+        except Exception:
+            pass
+
+    time.sleep(timeout)
+    try:
+        packets = sniffer.stop()
+    except Exception:
+        return result
+
+    for pkt in packets or []:
+        if not pkt.haslayer(DNS):
+            continue
+        dns = pkt[DNS]
+        for i in range(dns.ancount or 0):
+            try:
+                rr = dns.an[i]
+            except (IndexError, TypeError):
+                break
+            if not isinstance(rr, DNSRR) or rr.type != 12:  # 12 == PTR
+                continue
+            rrname = rr.rrname
+            if isinstance(rrname, bytes):
+                rrname = rrname.decode("utf-8", "ignore")
+            labels = rrname.rstrip(".").split(".")
+            if len(labels) < 6 or labels[-2:] != ["in-addr", "arpa"]:
+                continue
+            ip = ".".join(reversed(labels[:4]))
+            name = rr.rdata
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", "ignore")
+            name = name.rstrip(".")
+            if name:
+                result[ip] = name
+    return result
 
 
 def lookup_vendor(mac: str, vendors: dict[str, str]) -> str:
@@ -404,6 +476,33 @@ def infer_device_type(
     return "Unknown"
 
 
+def finalize_device(
+    device: dict[str, str],
+    aliases: dict[str, dict[str, str]],
+    my_ip: str,
+    gateway_ip: str,
+) -> None:
+    """Refresh alias and type from the (possibly newly resolved) hostname."""
+    ip, mac, hostname = device["ip"], device["mac"], device["hostname"]
+    alias = lookup_alias(ip, mac, hostname, aliases)
+    if ip == my_ip and alias:
+        alias = f"{alias} (this PC)"
+    elif ip == my_ip:
+        alias = "this PC"
+    device["alias"] = alias
+    device["device_type"] = infer_device_type(
+        ip, device["vendor"], hostname, alias, my_ip, gateway_ip
+    )
+
+
+def ipv4_sort_key(item: dict[str, str]) -> tuple:
+    """Sort by IPv4; IPv6-only devices (no dotted-quad IP) go last."""
+    try:
+        return (0,) + tuple(int(part) for part in item["ip"].split("."))
+    except ValueError:
+        return (1, 0, 0, 0, 0)
+
+
 def scan_network(iface: str, network: ipaddress.IPv4Network, timeout: float) -> list:
     ans, _ = srp(
         Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(network)),
@@ -414,8 +513,86 @@ def scan_network(iface: str, network: ipaddress.IPv4Network, timeout: float) -> 
     return list(ans)
 
 
+def ping_ipv6_all_nodes(iface: str, timeout: float) -> None:
+    """Ping the all-nodes multicast address ff02::1 to wake devices and fill our
+    IPv6 neighbor table. Phones usually prefer IPv6, so plain ARP can't see them."""
+    try:
+        from scapy.all import IPv6, ICMPv6EchoRequest
+    except Exception:
+        return
+    try:
+        srp(
+            Ether(dst="33:33:00:00:00:01")
+            / IPv6(dst="ff02::1")
+            / ICMPv6EchoRequest(),
+            iface=iface,
+            timeout=timeout,
+            verbose=0,
+        )
+    except Exception:
+        pass
+
+
+def read_ipv6_neighbors() -> dict[str, list[str]]:
+    """Read the system IPv6 neighbor table -> {normalized_mac: [ipv6, ...]}. Windows only."""
+    neighbors: dict[str, list[str]] = {}
+    if platform.system() != "Windows":
+        return neighbors
+
+    try:
+        result = subprocess.run(
+            ["netsh", "interface", "ipv6", "show", "neighbors"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return neighbors
+
+    row_re = re.compile(
+        r"^\s*([0-9A-Fa-f:]+(?:%\w+)?)\s+([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})\s+(\S+)"
+    )
+    for line in result.stdout.splitlines():
+        match = row_re.match(line)
+        if not match:
+            continue
+        addr, mac, state = match.group(1), match.group(2), match.group(3).lower()
+        if state in {"unreachable", "incomplete"}:
+            continue
+        addr = addr.split("%")[0]  # drop the zone id, e.g. fe80::1%14
+        if addr.startswith("ff") or addr in {"::", "::1"}:
+            continue  # skip multicast / unspecified
+        neighbors.setdefault(normalize_mac(mac), []).append(addr)
+    return neighbors
+
+
+def merge_ipv6(devices: list[dict[str, str]], neighbors: dict[str, list[str]]) -> None:
+    """Merge IPv6 addresses into the device list by MAC; add IPv6-only devices too."""
+    by_mac = {normalize_mac(item["mac"]): item for item in devices}
+    for mac, addrs in neighbors.items():
+        # Prefer showing global addresses before link-local fe80:: ones.
+        addrs_sorted = sorted(addrs, key=lambda a: a.lower().startswith("fe80"))
+        if mac in by_mac:
+            by_mac[mac]["ipv6"] = ", ".join(addrs_sorted)
+        else:
+            devices.append(
+                {
+                    "ip": "(IPv6 only)",
+                    "mac": ":".join(mac[i : i + 2] for i in range(0, 12, 2)),
+                    "vendor": "Unknown",
+                    "hostname": "",
+                    "alias": "",
+                    "device_type": "Unknown",
+                    "ipv6": ", ".join(addrs_sorted),
+                }
+            )
+
+
 def print_devices(devices: list[dict[str, str]]) -> None:
-    headers = ("序号", "IP地址", "MAC地址", "厂商", "主机名", "设备类型", "备注")
+    headers = ("No.", "IP", "MAC", "Vendor", "Hostname", "Type", "IPv6", "Note")
     rows = [
         (
             str(index),
@@ -424,6 +601,7 @@ def print_devices(devices: list[dict[str, str]]) -> None:
             item["vendor"],
             item["hostname"] or "-",
             item["device_type"],
+            item.get("ipv6") or "-",
             item["alias"] or "-",
         )
         for index, item in enumerate(devices, 1)
@@ -432,7 +610,7 @@ def print_devices(devices: list[dict[str, str]]) -> None:
     widths = [len(title) for title in headers]
     for row in rows:
         for index, value in enumerate(row):
-            widths[index] = min(max(widths[index], len(value)), 34)
+            widths[index] = min(max(widths[index], len(value)), 39)
 
     line_format = "  ".join(f"{{:<{width}}}" for width in widths)
     print(line_format.format(*headers))
@@ -446,51 +624,42 @@ def resolve_selected_devices(
     aliases: dict[str, dict[str, str]],
     my_ip: str,
     gateway_ip: str,
+    iface: str,
 ) -> None:
     if not devices:
         return
 
-    print("\n输入设备序号查询主机名；可输入多个序号，例如 1,3,5；直接回车结束。")
+    print("\nEnter device numbers to resolve hostnames (e.g. 1,3,5). Empty line to finish.")
     while True:
-        selection = input("要查询的序号: ").strip()
+        selection = input("numbers: ").strip()
         if not selection:
             return
 
         selected_indexes: list[int] = []
-        for part in re.split(r"[,\s，]+", selection):
+        for part in re.split(r"[,\s]+", selection):
             if not part:
                 continue
             if not part.isdigit():
-                print(f"忽略无效输入: {part}")
+                print(f"ignoring invalid input: {part}")
                 continue
             index = int(part)
             if index < 1 or index > len(devices):
-                print(f"序号超出范围: {index}")
+                print(f"out of range: {index}")
                 continue
             selected_indexes.append(index)
 
         if not selected_indexes:
             continue
 
-        for index in dict.fromkeys(selected_indexes):
-            device = devices[index - 1]
-            print(f"正在查询 #{index} {device['ip']} ...")
-            hostname = resolve_hostname(device["ip"])
-            device["hostname"] = hostname
-            device["alias"] = lookup_alias(device["ip"], device["mac"], hostname, aliases)
-            if device["ip"] == my_ip and device["alias"]:
-                device["alias"] = f"{device['alias']} (本机)"
-            elif device["ip"] == my_ip:
-                device["alias"] = "本机"
-            device["device_type"] = infer_device_type(
-                device["ip"],
-                device["vendor"],
-                hostname,
-                device["alias"],
-                my_ip,
-                gateway_ip,
-            )
-            print(f"#{index} 主机名: {hostname or '未获取到'}")
+        to_resolve = [devices[i - 1] for i in dict.fromkeys(selected_indexes)]
+        # One mDNS batch for the whole selection (catches phones), then OS fallbacks.
+        mdns_names = mdns_reverse_lookup([d["ip"] for d in to_resolve], iface)
+        for device in to_resolve:
+            print(f"resolving {device['ip']} ...")
+            name = mdns_names.get(device["ip"]) or resolve_hostname(device["ip"])
+            device["hostname"] = name
+            finalize_device(device, aliases, my_ip, gateway_ip)
+            print(f"  {device['ip']} -> {name or 'not found'}")
 
         print()
         print_devices(devices)
@@ -506,35 +675,52 @@ def warn_if_proxy_arp(devices: list[dict[str, str]], network: ipaddress.IPv4Netw
     if repeated and not network.is_private:
         mac, count = max(repeated, key=lambda item: item[1])
         print(
-            f"[warn] 当前扫描的是公网/运营商网段，MAC {mac} 同时响应了 {count} 个 IP。",
+            f"[warn] this looks like a public/ISP subnet: MAC {mac} answered for {count} IPs.",
             file=sys.stderr,
         )
         print(
-            "[warn] 这通常不是家庭局域网设备列表，建议使用 --subnet 192.168.x.0/24 指定家庭网段。",
+            "[warn] that is usually not a home LAN. Use --subnet 192.168.x.0/24 to pick your home range.",
             file=sys.stderr,
         )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="扫描局域网在线设备并尽量识别设备信息")
-    parser.add_argument("--subnet", help="手动指定网段，例如 192.168.0.0/24")
-    parser.add_argument("--timeout", type=float, default=5.0, help="ARP 等待时间，默认 5 秒")
+    parser = argparse.ArgumentParser(description="Scan the LAN and identify devices.")
+    parser.add_argument("--subnet", help="subnet to scan, e.g. 192.168.0.0/24")
+    parser.add_argument("--timeout", type=float, default=5.0, help="ARP wait time, default 5s")
     parser.add_argument(
         "--resolve-names",
         action="store_true",
-        help="额外反查主机名，可能明显变慢",
+        help="also resolve hostnames (mDNS + reverse DNS + NetBIOS)",
     )
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="先快速扫描，再按序号选择设备查询主机名",
+        help="quick scan first, then resolve names by number on demand",
     )
     parser.add_argument(
         "--refresh-oui",
         action="store_true",
-        help="强制刷新本地厂商缓存",
+        help="force-refresh the local vendor cache",
     )
     return parser
+
+
+def resolve_all_hostnames(devices: list[dict[str, str]], iface: str) -> None:
+    """Fill in hostnames for every device. mDNS runs once on the main thread; the
+    remaining OS lookups run in a thread pool (those calls ARE thread-safe)."""
+    mdns_names = mdns_reverse_lookup([d["ip"] for d in devices], iface)
+    for device in devices:
+        if mdns_names.get(device["ip"]):
+            device["hostname"] = mdns_names[device["ip"]]
+
+    rest = [d for d in devices if not d["hostname"]]
+    if not rest:
+        return
+    with ThreadPoolExecutor(max_workers=min(16, len(rest))) as pool:
+        names = pool.map(lambda d: resolve_hostname(d["ip"]), rest)
+    for device, name in zip(rest, names):
+        device["hostname"] = name
 
 
 def main() -> int:
@@ -545,7 +731,7 @@ def main() -> int:
     try:
         iface, my_ip, network = choose_scan_target(args.subnet)
     except Exception as exc:
-        print(f"[error] 无法确定扫描网卡/网段: {exc}", file=sys.stderr)
+        print(f"[error] cannot determine scan interface/subnet: {exc}", file=sys.stderr)
         return 1
 
     try:
@@ -555,12 +741,12 @@ def main() -> int:
 
     gateway_ip = resolve_gateway_ip()
 
-    print(f"使用网卡: {iface}")
-    print(f"本机 IP: {my_ip}")
-    print(f"本机 MAC: {my_mac}")
-    print(f"扫描网段: {network}")
+    print(f"Interface: {iface}")
+    print(f"My IP:     {my_ip}")
+    print(f"My MAC:    {my_mac}")
+    print(f"Subnet:    {network}")
     if gateway_ip:
-        print(f"默认网关: {gateway_ip}")
+        print(f"Gateway:   {gateway_ip}")
     print("=" * 96)
 
     replies = scan_network(iface, network, args.timeout)
@@ -576,44 +762,45 @@ def main() -> int:
         seen_ips.add(ip)
 
         mac = received.hwsrc
-        vendor = lookup_vendor(mac, vendors)
-        hostname = resolve_hostname(ip) if args.resolve_names else ""
-        alias = lookup_alias(ip, mac, hostname, aliases)
-        device_type = infer_device_type(ip, vendor, hostname, alias, my_ip, gateway_ip)
-
-        if ip == my_ip and alias:
-            alias = f"{alias} (本机)"
-        elif ip == my_ip:
-            alias = "本机"
-
         devices.append(
             {
                 "ip": ip,
                 "mac": mac,
-                "vendor": vendor,
-                "hostname": hostname,
-                "alias": alias,
-                "device_type": device_type,
+                "vendor": lookup_vendor(mac, vendors),
+                "hostname": "",
+                "alias": "",
+                "device_type": "",
+                "ipv6": "",
             }
         )
 
-    devices.sort(key=lambda item: tuple(int(part) for part in item["ip"].split(".")))
+    if args.resolve_names and devices:
+        resolve_all_hostnames(devices, iface)
 
-    print(f"\n发现 {len(devices)} 个设备\n")
+    for device in devices:
+        finalize_device(device, aliases, my_ip, gateway_ip)
+
+    # Merge IPv6: phones usually prefer IPv6, so ARP alone neither sees nor limits them.
+    ping_ipv6_all_nodes(iface, min(args.timeout, 3.0))
+    merge_ipv6(devices, read_ipv6_neighbors())
+
+    devices.sort(key=ipv4_sort_key)
+
+    print(f"\nFound {len(devices)} device(s)\n")
     if devices:
         print_devices(devices)
         print("=" * 96)
         warn_if_proxy_arp(devices, network)
     else:
-        print("没有发现设备。")
+        print("No devices found.")
 
     if not ALIASES_PATH.exists():
         print(
-            f"\n提示: 可以新建 {ALIASES_PATH.name} 给已知设备起别名，便于下次直接识别。",
+            f"\nTip: create {ALIASES_PATH.name} to give known devices friendly names.",
         )
 
     if args.interactive and devices:
-        resolve_selected_devices(devices, aliases, my_ip, gateway_ip)
+        resolve_selected_devices(devices, aliases, my_ip, gateway_ip, iface)
 
     return 0
 
