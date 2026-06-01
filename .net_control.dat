@@ -1,0 +1,1 @@
+{"child_mac": "dc:56:7b:d4:68:7f", "gateway_mac": "90:fb:5d:f4:bb:3c", "my_mac": "f8:3d:c6:57:ec:fa", "child_ll": "fe80::de56:7bff:fed4:687f", "child_ipv6_addrs": ["fe80::de56:7bff:fed4:687f"], "gateway_ll": "fe80::92fb:5dff:fef4:bb3c", "ipv6_ok": true, "child_ip": "192.168.31.195", "iface": "\\Device\\NPF_{AA048351-E167-4048-B0E0-6AD727E83BCE}", "my_ip": "192.168.31.15"}

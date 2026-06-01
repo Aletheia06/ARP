@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 
 CONFIG_PATH = Path(__file__).with_name("parent_proxy_config.json")
+MONITOR_LOG_PATH = Path(__file__).with_name("parent_proxy_monitor.log")
 BUFFER_SIZE = 4096
 DEFAULT_CONFIG = {
     "listen_host": "0.0.0.0",
@@ -35,6 +36,7 @@ DEFAULT_CONFIG = {
     "mode": "normal",
     "slow_kbps": 4,
     "block_message": "Network is paused by parent control.",
+    "monitor_client_ip": "",
 }
 
 
@@ -55,6 +57,20 @@ def save_config(config: dict) -> None:
     with CONFIG_PATH.open("w", encoding="utf-8") as file:
         json.dump(config, file, indent=2, ensure_ascii=False)
         file.write("\n")
+
+
+def should_monitor_client(client_ip: str) -> bool:
+    monitor_ip = str(load_config().get("monitor_client_ip", "")).strip()
+    return bool(monitor_ip) and client_ip == monitor_ip
+
+
+def log_monitored_request(client_ip: str, protocol: str, target: str) -> None:
+    if should_monitor_client(client_ip):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[monitor {timestamp}] {client_ip} {protocol} {target}"
+        print(line, flush=True)
+        with MONITOR_LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
 
 
 def set_mode(mode: str) -> None:
@@ -140,6 +156,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Bad CONNECT target")
             return
 
+        log_monitored_request(self.client_address[0], "CONNECT", f"{host}:{port}")
+
         try:
             remote = socket.create_connection((host, port), timeout=10)
         except OSError as exc:
@@ -206,6 +224,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not host:
             self.send_error(400, "Missing host")
             return
+
+        log_monitored_request(self.client_address[0], self.command, f"{host}:{port}")
 
         path = self.path
         if parsed.scheme and parsed.netloc:
